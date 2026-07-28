@@ -1,185 +1,107 @@
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/genlayerlabs/brand-assets/main/logo/genlayer-mark.svg" width="72" alt="GenLayer" onerror="this.style.display='none'" />
+
 # GenLayer Intelligent Contracts
 
-A collection of Intelligent Contracts built for the GenLayer testnet,
-demonstrating web access, LLM reasoning, and on-chain AI consensus.
+**Consensus-native Python contracts for the GenLayer network.**
+Live web evidence, LLM-adjudicated verdicts, independent multi-validator re-derivation — verified on-chain, not asserted.
 
-## Contracts
+[![GenVM](https://img.shields.io/badge/runtime-GenVM-6C5CE7?style=flat-square)](https://docs.genlayer.com)
+[![Python](https://img.shields.io/badge/language-Python-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2ECC71?style=flat-square)](./LICENSE)
+[![Network](https://img.shields.io/badge/networks-StudioNet%20%7C%20Bradbury-orange?style=flat-square)](https://studio.genlayer.com)
 
-### 1. News Sentiment Oracle
-
-Fetches live news about any topic and uses an LLM to determine
-overall sentiment (positive/negative/neutral). Result stored on-chain
-after validator consensus.
-
-**Deploy params:** `topic` (string, e.g. "artificial intelligence")
-
-### 2. GitHub Reputation Registry
-
-On-chain registry of developer reputation scores. Submit any GitHub
-username — the contract fetches the public profile, scores activity
-via LLM, and stores the result trustlessly.
-
-**Deploy params:** none (registry is open after deploy)
-**Key methods:** `analyze_profile(username)`, `get_profile(username)`
-
-### 3. DAO Proposal Evaluator
-
-Governance contract that stores a DAO constitution and evaluates
-proposals against it using AI consensus. Verdicts are trustless —
-multiple validators run the same LLM prompt and must agree.
-
-**Deploy params:** `dao_name`, `constitution` (the rules text)
-**Key methods:** `submit_proposal(title, description)`, `evaluate_proposal(id)`
-
-## Deployment
-
-All contracts deploy via [GenLayer Studio](https://studio.genlayer.com).
-See [docs/deployment.md](docs/deployment.md) for step-by-step instructions.
-
-## Tech
-
-* Language: Python (GenVM)
-* Network: GenLayer Testnet (Asimov/Bradbury)
-* Features used: `gl.nondet.web.get`, `gl.nondet.exec_prompt`,
-  `gl.eq_principle.strict_eq`, on-chain storage, multi-function contracts
+</div>
 
 ---
 
-# GenLayer Intelligent Contracts — Batch 2
+## What lives here
 
-Three Intelligent Contracts built for [GenLayer Studio](https://studio.genlayer.com) and the [GenLayer Foundation Portal](https://portal.genlayer.foundation). Each contract uses GenLayer-native features: live web access (`gl.get_webpage`), LLM reasoning (`gl.exec_prompt`), and the equivalence principle (`gl.eq_principle.strict_eq`) for decentralized consensus on non-deterministic outputs.
+This repository holds Intelligent Contracts deployed to the GenLayer network — Python programs that run on GenVM, fetch live evidence from the open web, ask an LLM to judge that evidence against a fixed standard, and finalize a verdict only once independent validators agree.
 
----
+The current, actively maintained contract sits in **[`contracts/updated/`](./contracts/updated/)**. That folder is replaced wholesale each time a new contract goes live — always exactly one file, always the latest. Everything in the top-level `contracts/` folder is retained history from earlier submissions and is not part of the active build.
 
-## Contracts
-
-### 1. WeatherCropAdvisor
-
-**File:** `contracts/WeatherCropAdvisor.py`
-
-Fetches real-time weather data for a given region and uses an LLM to assess whether current conditions are suitable for growing a specified crop. Returns a suitability rating (`suitable`, `marginal`, `unsuitable`) and a one-sentence farming recommendation.
-
-**Constructor params:** `region: str`, `crop: str`
-**Example:** `region = "Dhaka"`, `crop = "rice"`
+**Every contract in this repository — past or present — is built against the same non-negotiable rule set below.** That rule set is what this README documents, so that adding a new contract never requires touching this file again.
 
 ---
 
-### 2. JobMarketPulse
+## The rule set every contract here follows
 
-**File:** `contracts/JobMarketPulse.py`
+### Consensus is structural, not decorative
 
-Reads a live remote job board and assesses current demand level for a given technical skill. Returns demand classification (`high`, `medium`, `low`) and the top job titles where that skill appears.
+A contract only belongs on GenLayer if it judges a **genuinely contested claim** — one where a real, adversarial party benefits from a false verdict. If no one benefits from the LLM being wrong, there's no dispute to arbitrate, and multi-validator consensus is theater bolted onto an ordinary API call. Every contract here can name, in one sentence, who benefits from a false "yes" and who benefits from a false "no."
 
-**Constructor params:** `skill: str`
-**Example:** `skill = "Solidity"`
+### Evidence is fetched, never trusted
 
----
+No contract judges a claim from a party's own description of it. Evidence is retrieved live, inside the same consensus round that produces the verdict, via GenVM's native web-access primitive — and at least one evidence source is fixed and independently authoritative, chosen by neither party to the dispute. A caller-selected page proves only that the page exists; it never substitutes for a standard neither side controls.
 
-### 3. CountryRegulatoryTracker
+### Validators independently re-derive, they don't rubber-stamp
 
-**File:** `contracts/CountryRegulatoryTracker.py`
+A validator that only checks "the leader returned something" proves nothing — it would pass on any plausible-sounding, adversarially-crafted text. Every write function that produces an LLM judgment has its validator logic independently re-run the leader's own reasoning and compare the *actual result*, not merely confirm a response arrived in the expected shape.
 
-Queries recent news for a country's current regulatory stance on a given topic (e.g. AI, crypto, data privacy). Returns a stance classification (`permissive`, `restrictive`, `neutral`, `unclear`) and a one-sentence summary.
+### Reasoning has to touch the evidence, not just describe it
 
-**Constructor params:** `country: str`, `topic: str`
-**Example:** `country = "United States"`, `topic = "AI regulation"`
+A sufficiently long, fluent explanation is not the same thing as a correct one. Where a contract's validator checks the LLM's stated reasoning, it checks for concrete engagement with what was actually fetched — not a length threshold, not generic confidence in prose.
 
----
+### Determinism is enforced at the type level
 
-## Technical Approach
+Non-deterministic language-model output crosses into deterministic on-chain state only through integer types. Floating-point values never appear anywhere reachable from a consensus-sensitive code path, including as a transient parsing step. Confidence and scoring values are always fixed-point integers.
 
-All three contracts follow the same proven architecture:
+### Settlement is a consequence, never a wager
 
-* Class-level annotations use only `str` and `bool` — GenVM-safe types
-* No `dict`, `int`, or `list` at class level (crashes the schema parser)
-* Integer-style state tracked via `bool` flags
-* `__init__` handles all mutable state initialization
-* `gl.eq_principle.strict_eq` wraps all non-deterministic calls for validator consensus
-* Write functions are one-shot: guarded by a `has_*` boolean to prevent double execution
-* All view functions return simple primitives
+Where a contract moves value, that movement is the deterministic output of a judged, evidence-based verdict — a security-deposit pattern, not a game of chance. No contract here has, or could be repurposed as, an odds-based or speculative payout mechanism.
 
 ---
 
-## Repository
-
-**GitHub:** [siriron/genlayer-intelligent-contracts](https://github.com/siriron/genlayer-intelligent-contracts)
-
-See `docs/deployment.md` for full deployment instructions.
-
----
-
-# GenLayer Intelligent Contracts — Batch 3
-
-Three Intelligent Contracts focused on professional-grade business intelligence. Each contract accepts open-ended input, fetches live data from public sources, applies LLM reasoning, and stores structured results on-chain after validator consensus via the equivalence principle.
-
----
-
-## Contracts
-
-### 1. SupplyChainDisruptionTracker
-
-**File:** `contracts/supply_chain_disruption_tracker.py`
-
-Fetches live news for any industry and uses LLM analysis to assess supply chain disruption severity, identify affected regions, and produce a concrete recommendation for businesses. Results are stored on-chain per industry and readable by anyone.
-
-**Constructor params:** none (registry is open after deploy)
-**Key methods:** `track_industry(industry)`, `analyze_disruption(industry)`, `get_disruption(industry)`, `get_severity(industry)`, `get_recommendation(industry)`
-**Example input:** `industry = "semiconductors"`
-
----
-
-### 2. LaborMarketStressMonitor
-
-**File:** `contracts/labor_market_stress_monitor.py`
-
-Monitors labor market conditions for any economic sector using live news. LLM classifies the stress level (`stable`, `moderate`, `stressed`, `critical`), identifies the hiring trend (`hiring`, `neutral`, `layoffs`), and surfaces the key driver behind current conditions.
-
-**Constructor params:** none (registry is open after deploy)
-**Key methods:** `add_sector(sector)`, `analyze_sector(sector)`, `get_report(sector)`, `get_stress_level(sector)`, `get_trend(sector)`, `get_key_driver(sector)`
-**Example input:** `sector = "technology"`
-
----
-
-### 3. CorporateESGScorecard
-
-**File:** `contracts/corporate_esg_scorecard.py`
-
-Evaluates any publicly known company across Environmental, Social, and Governance pillars using live news. Each pillar receives a rating (`poor`, `fair`, `good`, `excellent`) alongside an overall score and a one-sentence summary. Produces a neutral, tamper-resistant ESG record stored on-chain.
-
-**Constructor params:** none (registry is open after deploy)
-**Key methods:** `add_company(company)`, `evaluate_company(company)`, `get_scorecard(company)`, `get_overall_rating(company)`, `get_environmental(company)`, `get_social(company)`, `get_governance(company)`
-**Example input:** `company = "Microsoft"`
-
----
-
-## Technical Approach
-
-All Batch 3 contracts follow the established GenLayer architecture:
-
-* Class-level annotations: `str`, `bool` only — GenVM-safe
-* `dict` and `list` initialized exclusively in `__init__`
-* `bool` flags used for state tracking instead of integer counters
-* All non-deterministic calls (`gl.get_webpage`, `gl.exec_prompt`) wrapped in `gl.eq_principle.strict_eq`
-* LLM outputs parsed as JSON with fallback error handling
-* No ETH handling, no token transfers, no financial logic — pure information infrastructure
-
----
-
-## Full Repository Structure
+## Architecture
 
 ```
-genlayer-intelligent-contracts/
-├── contracts/
-│   ├── NewsSentimentOracle.py
-│   ├── GitHubReputationRegistry.py
-│   ├── DAOProposalEvaluator.py
-│   ├── WeatherCropAdvisor.py
-│   ├── JobMarketPulse.py
-│   ├── CountryRegulatoryTracker.py
-│   ├── supply_chain_disruption_tracker.py
-│   ├── labor_market_stress_monitor.py
-│   └── corporate_esg_scorecard.py
-├── docs/
-│   └── deployment.md
-└── README.md
+Party submits a claim, locking terms that neither party can retroactively edit
+                              │
+                              ▼
+        Contract fetches live evidence (gl.nondet.web.get)
+                              │
+                              ▼
+     Leader validator produces a structured verdict + reasoning
+                              │
+                              ▼
+   Independent validators re-derive the verdict from the same evidence
+                    and require it to agree
+                              │
+                              ▼
+        Consensus-finalized verdict triggers on-chain settlement
 ```
+
+Every contract in `contracts/updated/` implements this shape using GenVM's confirmed-correct primitives:
+
+| Concern | Primitive |
+|---|---|
+| Non-deterministic judgment | `gl.vm.run_nondet_unsafe(leader_fn, validator_fn)` — called positionally |
+| Live evidence | `gl.nondet.web.get(url)` → `Response` object (`.body`, `.status_code`) |
+| LLM inference | `gl.nondet.exec_prompt(prompt, response_format="json")` |
+| Key-value storage | `TreeMap`, never `DynArray` for lookups |
+| Structured records | `@allow_storage @dataclass`, never `gl.Record` |
+| Cross-contract value transfer | `.emit_transfer(value=...)`, never `.send(` |
+| Storage inside a consensus block | `gl.storage.copy_to_memory(...)` before entering `run_nondet_unsafe` — storage is never read directly inside leader/validator logic |
+| View functions | Always return `str` via `json.dumps()` |
+
+Every contract's own module docstring contains its specific concept, its consensus-necessity argument, and its validator design — that explanation travels with the file itself rather than living here, which is exactly why this document doesn't need to change when a new contract is added.
+
+---
+
+## Deploying a contract from this repository
+
+See **[`docs/deployment.md`](./docs/deployment.md)** for the full, contract-agnostic deployment walkthrough — it works identically for anything placed in `contracts/updated/`.
+
+---
+
+## License
+
+Released under the [MIT License](./LICENSE).
+
+---
+
+<div align="center">
+<sub>Built on <a href="https://genlayer.com">GenLayer</a> — the intelligence layer of the internet.</sub>
+</div>
