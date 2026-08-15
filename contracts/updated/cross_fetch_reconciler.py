@@ -190,6 +190,33 @@ def _fetch_text(url) -> str:
         return "[fetch failed: unreachable or errored]"
 
 
+_FETCH_FAILURE_PREFIX = "[fetch failed:"
+_FETCH_MISSING_MARKER = "[no URL provided]"
+
+
+def _fetch_text_or_raise(url) -> str:
+    # Fail-closed wrapper around _fetch_text for use inside leader_fn.
+    # _fetch_text's marker strings (e.g. "[fetch failed: HTTP 404]") exist
+    # so a contract CAN choose to hand a failure to the model as evidence
+    # against whoever cited it — the documented Bug 1 pattern (section 4).
+    # That choice is wrong for THIS contract specifically: reconciliation
+    # has no claimant/respondent for a failed fetch to count against, so
+    # a marker string here would instead just become ordinary prompt text
+    # the model is free to extract plausible-sounding facts from. A
+    # fetch failure must never reach _build_extraction_prompt as content.
+    # Raising here means leader_fn never returns for a failed fetch — the
+    # leader result is not a gl.vm.Return, so validator_fn's existing
+    # isinstance(leaders_res, gl.vm.Return) check already treats this as
+    # disagreement and forces leader rotation, per this project's own
+    # confirmed pattern for malformed/unusable nondet input (section 4,
+    # "for malformed LLM output... validator should disagree... leader
+    # should raise a short deterministic gl.vm.UserError").
+    fetched = _fetch_text(url)
+    if fetched == _FETCH_MISSING_MARKER or fetched.startswith(_FETCH_FAILURE_PREFIX):
+        raise gl.vm.UserError("fetch_unsuccessful")
+    return fetched
+
+
 def _extract_field(data, key):
     if key in data and data[key] is not None:
         return data[key]
@@ -209,6 +236,10 @@ def _normalize_fact(raw) -> str:
     return collapsed.lower()
 
 
+_IDENTIFYING_FIELDS = ("title", "primary_identifier")
+_MIN_NONEMPTY_IDENTIFYING_FIELDS = 1
+
+
 def _parse_facts_json(result) -> dict:
     if not isinstance(result, dict):
         raise gl.vm.UserError("llm_non_dict_response")
@@ -216,6 +247,19 @@ def _parse_facts_json(result) -> dict:
     for field in _FACT_FIELDS:
         raw = _extract_field(result, field)
         facts[field] = _sanitize(raw if isinstance(raw, str) else "", _MAX_FIELD_LEN)
+    # A facts dict with no identifying content is not a real observation —
+    # it must never be stored (batch #1) or compared (batch #2). Without
+    # this, two content-free extractions normalize to "" on every field
+    # and _normalize_fact("") == _normalize_fact("") trivially passes,
+    # letting two failed/empty observations finalize as "matched" even
+    # though neither page was ever meaningfully read. status_text is
+    # correctly allowed to be empty per the extraction charter ("if the
+    # page states one, else the empty string"), so only title and
+    # primary_identifier — the two fields the charter always expects a
+    # real page to yield something for — count toward this floor.
+    nonempty_identifying = sum(1 for f in _IDENTIFYING_FIELDS if len(facts[f]) > 0)
+    if nonempty_identifying < _MIN_NONEMPTY_IDENTIFYING_FIELDS:
+        raise gl.vm.UserError("insufficient_identifying_data")
     return facts
 
 
@@ -284,7 +328,7 @@ class CrossFetchReconciler(gl.Contract):
         # Bug 6 fix: nested function, zero self reference. Closes only
         # over clean_url (a plain local str) and module-level constants.
         def leader_fn():
-            fetched = _fetch_text(clean_url)
+            fetched = _fetch_text_or_raise(clean_url)
             prompt = _build_extraction_prompt(fetched)
             result = gl.nondet.exec_prompt(prompt, response_format="json")
             return _parse_facts_json(result)
@@ -362,7 +406,7 @@ class CrossFetchReconciler(gl.Contract):
         # over b_mem (the memory copy), clean_second_url (a plain local
         # str), and module-level constants/helpers.
         def leader_fn():
-            fetched = _fetch_text(clean_second_url)
+            fetched = _fetch_text_or_raise(clean_second_url)
             prompt = _build_extraction_prompt(fetched)
             result = gl.nondet.exec_prompt(prompt, response_format="json")
             facts = _parse_facts_json(result)
