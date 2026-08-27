@@ -23,18 +23,36 @@ The technique: Crossref is used the same way RetractionWatch already
 trusts it (a fixed, independently-fetched, non-submitter-controlled
 bibliographic record) — but for a different field. Crossref's works API
 exposes a "relation" object that can list "is-supplemented-by" or
-"has-preprint" style links, and many publishers populate a
-"data-availability" or "funder"/"assertion" block with a stated
-repository DOI. This contract fetches that Crossref record fresh, extracts
-whatever declared-artifact links exist (deterministically, via a fixed
-key set — never asking the LLM to invent or guess a DOI), and gives the
-LLM a narrowed, factual question: given the paper's own text AND the
-submitter's specific claimed finding, does the declared artifact (if any)
-actually plausibly cover that finding's subject matter, or is the
-artifact link present but unrelated (e.g. code for a different section of
-the paper), or is there no declared artifact at all. The contract itself
-never asks the LLM whether a DOI or repository URL is "real" — that is
-confirmed by the deterministic Crossref fetch, not the model's opinion.
+"is-data-basis-for" style links, restricted here to relation TYPES that
+specifically denote a reproducibility artifact (never every relation type
+Crossref happens to list — a bibliographic relationship like
+"is-preprint-of" or "is-part-of" says nothing about reproducibility, and
+extracting it would hand the LLM an unrelated link and ask it to judge
+"topical relevance" against a finding it can never actually back). Every
+fetched Crossref payload is also checked for its own self-reported DOI
+matching the DOI the contract requested it under, BEFORE any of its
+content — text or artifact list — is used for anything; a payload that
+doesn't confirm being about the requested paper is treated identically to
+a fetch failure (resolving 'unverifiable'), never silently trusted. This
+contract fetches that identifier-verified Crossref record fresh, extracts
+whatever reproducibility-relevant artifact links exist (deterministically,
+via the fixed relation-type set — never asking the LLM to invent or guess
+a DOI), and gives the LLM a narrowed, factual question: given the paper's
+OWN abstract (also taken from this same identifier-verified record, never
+a separate caller-supplied text URL) AND the submitter's specific claimed
+finding, does the declared artifact (if any) actually plausibly cover
+that finding's subject matter, or is the artifact link present but
+unrelated (e.g. code for a different section of the paper), or is there
+no declared artifact at all. The contract itself never asks the LLM
+whether a DOI or repository URL is "real" — that is confirmed by the
+deterministic, identifier-verified Crossref fetch, not the model's
+opinion. A genuinely empty declared-artifact list (record verified, list
+empty) and a Crossref fetch/verification failure are kept as two
+distinct, separately-tracked facts throughout — collapsing them was a
+confirmed defect in an earlier version of this contract, since a fetch
+failure and "the paper truly declares nothing" are different claims about
+the world and warrant different verdicts (unverifiable vs.
+artifact_undeclared).
 
 This is the same "narrow the LLM's job to the genuinely judgment-shaped
 part; verify the factual part outside the prompt" structural move used
@@ -82,6 +100,13 @@ DELIBERATE GAPS, STATED:
       "caller/submitter-shaped free text becomes load-bearing evidence"
       failure pattern this project's two confirmed rejections
       (SourceChecker, Chronomark) already establish as unacceptable.
+    - The paper's text source is now Crossref's OWN "abstract" field on
+      the identifier-verified record, not a separately fetched full-text
+      page. Not every Crossref record populates an abstract; when absent,
+      the LLM is honestly given a marker string rather than the contract
+      substituting a second, unverified fetch source — trading narrower
+      text coverage for a text source that's actually bound to the DOI,
+      which is the whole point of this fix.
     - The contract confirms an artifact LINK is declared and topically
       plausible per the LLM's narrowed judgment; it does not itself fetch
       and verify the artifact's own content (e.g. actually opening a
@@ -94,6 +119,24 @@ DELIBERATE GAPS, STATED:
       chars), consistent with every other contract in this project.
     - Only one claimed finding is checked per resolve_check call. A
       multi-finding variant is a real extension, not required here.
+
+STEWARD-REQUESTED FIXES APPLIED (this revision):
+    1. Crossref fetch failure OR identifier-verification failure now
+       resolves 'unverifiable', structurally distinct from a genuinely-
+       empty declared-artifact list (which still resolves
+       'artifact_undeclared'). Tracked via a separate _crossref_extraction_ok
+       flag, independently re-derived and compared by validator_fn.
+    2. Relation-type extraction restricted to
+       _REPRODUCIBILITY_RELATION_TYPES — a fixed, documented Crossref
+       vocabulary subset that actually denotes reproducibility artifacts,
+       never every relation type a record happens to list.
+    3. paper_text_url removed entirely as a caller-supplied field. Paper
+       text is now the identifier-verified Crossref record's own abstract
+       field — bound to the DOI structurally, never an unverified URL.
+    4. artifact_backed is now a code-enforced assertion in validator_fn,
+       not implied by leader/validator URL agreement alone: it explicitly
+       requires _declared_artifact_count > 0 AND that the matched URL is
+       a literal member of the deterministically extracted URL list.
 """
 
 from genlayer import *
@@ -118,11 +161,18 @@ _CHARTER = (
     "backed by a reproducibility artifact (a preregistration, a deposited "
     "dataset, or a code repository) that the paper's OWN bibliographic "
     "record declares. You will be given: (1) the specific finding text the "
-    "submitter is asking about, (2) the paper's own fetched text/abstract, "
-    "and (3) a list of artifact links the paper's Crossref record itself "
-    "declares (this list was extracted by the contract from Crossref "
-    "directly, not supplied by the submitter — if it is empty, the paper's "
+    "submitter is asking about, (2) the paper's own abstract, taken "
+    "directly from ITS OWN Crossref record for the submitted DOI (never a "
+    "separate, unverified URL), and (3) a list of artifact links extracted "
+    "from that SAME Crossref record, restricted to relation types that "
+    "specifically denote reproducibility artifacts (this list was "
+    "extracted by the contract directly, not supplied by the submitter — "
+    "if it is empty AND the record was successfully verified, the paper's "
     "own record declares no such artifact at all).\n\n"
+    "If the paper text explicitly states that Crossref could not be "
+    "fetched or could not be confirmed to be about the submitted DOI, "
+    "you MUST return 'unverifiable' — do not attempt to judge the finding "
+    "or the artifact list in that case, since neither can be trusted.\n\n"
     "Do not judge whether any declared link is a real, working URL or "
     "whether its target actually contains valid data — that is outside "
     "your judgment. Your job is only: given the declared artifact link(s) "
@@ -135,12 +185,14 @@ _CHARTER = (
     "one artifact link, but none of them plausibly relate to THIS specific "
     "finding (e.g. the paper has a data-availability link, but it covers a "
     "different experiment than the one the submitter asked about). Return "
-    "'artifact_undeclared' if the declared-artifact list provided to you is "
-    "empty — the paper's own record declares nothing at all, regardless of "
-    "what the paper's prose claims about availability. Return "
-    "'unverifiable' if the paper's text failed to fetch or is too "
-    "incomplete to judge which finding is even being referenced — use this "
-    "honestly rather than forcing a guess between the other three."
+    "'artifact_undeclared' if the record was successfully verified and the "
+    "declared-artifact list provided to you is empty — the paper's own "
+    "record declares nothing at all, regardless of what the paper's prose "
+    "claims about availability. Return 'unverifiable' if Crossref could "
+    "not be fetched, could not be confirmed to match the submitted DOI, or "
+    "the abstract is too incomplete to judge which finding is even being "
+    "referenced — use this honestly rather than forcing a guess between "
+    "the other three."
 )
 
 _VERDICT_ALIASES = ("verdict", "result", "decision", "outcome", "judgment")
@@ -265,27 +317,6 @@ def _parse_leader_json(result) -> dict:
 # Fetch helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_text(url) -> str:
-    """General-purpose fetch, confirmed via gl.nondet.web.get()."""
-    if not url:
-        return "[no URL provided]"
-    try:
-        response = gl.nondet.web.get(url)
-        status = getattr(response, "status_code", None)
-        if status is not None and status >= 400:
-            return f"[fetch failed: HTTP {status}]"
-        body = getattr(response, "body", None)
-        if body is None:
-            return "[fetch failed: empty response]"
-        if isinstance(body, bytes):
-            return body.decode("utf-8", errors="replace")
-        if isinstance(body, str):
-            return body
-        return "[fetch failed: unrecognized response format]"
-    except Exception:
-        return "[fetch failed: unreachable or errored]"
-
-
 def _fetch_json(url):
     """
     Structured-API fetch, via gl.nondet.web.request(url, method='GET').
@@ -321,42 +352,113 @@ def _crossref_works_url(doi: str) -> str:
     return f"https://api.crossref.org/works/{doi}"
 
 
-def _extract_declared_artifacts_from_crossref(payload) -> list:
+def _has_reportedly_matching_doi(payload, expected_doi: str) -> bool:
+    """
+    Identifier-verification gate on a fetched Crossref payload: confirms
+    the payload's OWN self-reported DOI field (message.DOI, per Crossref's
+    documented works-API response shape) matches the DOI we requested it
+    under. Comparison is case-insensitive (DOIs are conventionally
+    case-insensitive per the DOI Handbook) but otherwise exact — no fuzzy
+    matching. Returns False (never raises) on any malformed payload or
+    missing field, which safely fails the eventual artifact-extraction
+    step rather than trusting an unconfirmed record.
+
+    This exists because a fetched payload proves nothing about the DOI it
+    was requested for unless the payload itself reports being about that
+    DOI — the same identifier-binding gate CitationChain's rejection
+    established as required for any contract fetching a record by ID.
+    Without this check, a Crossref response shape that happened to parse
+    (even an error body, a redirect target, or a differently-keyed
+    record) could silently be treated as "this paper's own record."
+    """
+    try:
+        if not isinstance(payload, dict) or not isinstance(expected_doi, str):
+            return False
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return False
+        reported_doi = message.get("DOI")
+        if not isinstance(reported_doi, str):
+            return False
+        return reported_doi.strip().lower() == expected_doi.strip().lower()
+    except Exception:
+        return False
+
+
+# Crossref's documented "relation" object uses a fixed, published vocabulary
+# of relation-type keys (https://www.crossref.org/documentation/schema-library/markup-guide-record-types/relations/).
+# Only types that genuinely denote a reproducibility-relevant artifact —
+# supplementary material, an underlying dataset, or a code/software
+# repository — are extracted here. Types like "is-preprint-of",
+# "has-preprint", "is-part-of", "is-version-of", or "cites" describe real
+# bibliographic relationships but say nothing about reproducibility, and
+# extracting them would let the LLM be shown an unrelated link and asked
+# to judge its "topical relevance" against a finding — exactly the
+# format-only-signal problem this fix exists to close.
+_REPRODUCIBILITY_RELATION_TYPES = frozenset((
+    "is-supplemented-by",
+    "is-data-basis-for",
+    "has-data-basis",
+    "is-supplement-to",
+    "is-derived-from",
+    "is-source-of",
+))
+
+
+def _extract_declared_artifacts_from_crossref(payload, expected_doi: str):
     """
     Defensive, fixed-key-set extraction of declared-artifact links from a
-    Crossref works-API response. Deliberately narrow and deterministic —
-    only looks at specific, documented Crossref response fields, never
-    free-text scanning of an abstract or full-text for a stray
-    DOI-looking substring (that would reintroduce free-text-derived
-    evidence, the exact failure pattern this project's SourceChecker and
-    Chronomark rejections already establish as unacceptable).
+    Crossref works-API response, gated on two checks that must both pass
+    before any content is used:
+      (a) the payload's own self-reported DOI matches expected_doi (see
+          _has_reportedly_matching_doi above) — never extract from a
+          record that doesn't confirm being about the paper we asked for;
+      (b) only relation TYPES in _REPRODUCIBILITY_RELATION_TYPES are
+          extracted — never every relation type Crossref happens to list
+          (fix for the steward's "restrict candidate extraction to
+          relationships that actually represent reproducibility
+          artifacts" requirement).
 
-    Returns a list of {"url": str, "label": str} dicts — the raw material
+    Deliberately narrow and deterministic — only looks at specific,
+    documented Crossref response fields, never free-text scanning of an
+    abstract or full-text for a stray DOI-looking substring (that would
+    reintroduce free-text-derived evidence, the exact failure pattern
+    this project's SourceChecker and Chronomark rejections already
+    establish as unacceptable).
+
+    Returns (ok: bool, artifacts: list). ok=False means either the fetch
+    failed upstream or the identifier-verification gate failed — this is
+    DELIBERATELY a different signal from ok=True with an empty list,
+    which means the record was genuinely confirmed and genuinely declares
+    nothing. Collapsing these two cases together was the steward's first
+    named defect (a Crossref fetch/parse failure must resolve
+    'unverifiable', never 'artifact_undeclared') — keeping them distinct
+    here is what lets the caller make that distinction downstream.
+
+    Each artifact is a {"url": str, "label": str} dict — the raw material
     the LLM is given to judge topical relevance against, never asked to
     verify the URL itself is real (the contract already confirmed that by
-    the mere fact of it being present in Crossref's own structured
-    response, which is the fixed authoritative source here, same role
-    Crossref already plays for RetractionWatch's retraction-status field).
-
-    Returns [] (never raises) on any payload shape it doesn't recognize,
-    which correctly yields verdict 'artifact_undeclared' via the prompt's
-    own instruction to treat an empty list as "nothing declared."
+    the mere fact of it being present in a payload that passed the
+    identifier-verification gate, which is the fixed authoritative check
+    here, same role Crossref already plays for RetractionWatch's
+    retraction-status field).
     """
     try:
         if not isinstance(payload, dict):
-            return []
+            return False, []
+        if not _has_reportedly_matching_doi(payload, expected_doi):
+            return False, []
         message = payload.get("message")
         if not isinstance(message, dict):
-            return []
+            return False, []
 
         found = []
 
-        # Crossref's documented "relation" object can list keys such as
-        # "is-supplemented-by", "has-preprint", "is-data-basis-for" — each
-        # a list of {"id": ..., "id-type": ...} entries.
         relation = message.get("relation")
         if isinstance(relation, dict):
             for rel_type, entries in relation.items():
+                if rel_type not in _REPRODUCIBILITY_RELATION_TYPES:
+                    continue
                 if not isinstance(entries, list):
                     continue
                 for entry in entries:
@@ -370,11 +472,13 @@ def _extract_declared_artifacts_from_crossref(payload) -> list:
                             url = f"https://doi.org/{url}"
                         found.append({"url": url[:500], "label": f"relation:{rel_type}"})
 
-        # Some publishers populate a top-level "link" array with
-        # {"URL": ..., "content-type": ...} — not artifact-specific by
-        # default, but a content-type mentioning "dataset" or similar is
-        # a real, structured signal worth surfacing, distinct from the
-        # primary full-text/PDF links Crossref also lists there.
+        # Crossref's top-level "link" array lists {"URL": ...,
+        # "content-type": ...} entries. This is NOT gated by the relation-
+        # type vocabulary above (it's a structurally different Crossref
+        # field, not a relation type at all) but is still restricted to
+        # content-types that are actual reproducibility signals — a
+        # dataset or supplementary-material link, never the primary
+        # full-text/PDF link Crossref also lists in this same array.
         links = message.get("link")
         if isinstance(links, list):
             for entry in links:
@@ -386,9 +490,9 @@ def _extract_declared_artifacts_from_crossref(payload) -> list:
                     if any(kw in content_type.lower() for kw in ("dataset", "supplementary", "data")):
                         found.append({"url": url.strip()[:500], "label": f"link:{content_type}"})
 
-        return found[:20]  # bounded — never hand the prompt an unbounded list
+        return True, found[:20]  # bounded — never hand the prompt an unbounded list
     except Exception:
-        return []
+        return False, []
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +505,6 @@ class ReplicationCheck:
     check_id: u256
     submitter: Address
     paper_doi: str
-    paper_text_url: str
     claimed_finding_text: str
     status: str
     verdict: str
@@ -419,23 +522,26 @@ class ReplicationBind(gl.Contract):
         self.next_id = u256(1)
 
     # ------------------------------------------------------------------
-    # Submission (fully deterministic, no nondet). The submitter names the
-    # paper's DOI, a URL where its full text/abstract can be fetched (for
-    # the LLM's topical-matching judgment), and the specific finding text
-    # they're asking about. The submitter's DOI is not trusted as "this
-    # paper declares an artifact" in itself — resolve_check independently
-    # fetches Crossref's own record for that DOI and extracts whatever it
-    # actually finds, which may be nothing.
+    # Submission (fully deterministic, no nondet). The submitter names
+    # ONLY the paper's DOI and the specific finding they're asking about —
+    # no separate "paper text URL" field. This is a deliberate structural
+    # fix, not a trim: a caller-supplied text URL with no binding to the
+    # DOI is exactly the identifier-binding gap CitationChain's rejection
+    # named ("the fetched record... never verified to belong to the
+    # stored patent identifiers") and the steward flagged here too ("bind
+    # the paper text to the DOI through an independently derived or
+    # verified source"). resolve_check now derives the paper's text from
+    # Crossref's OWN record for the submitted DOI (the abstract field,
+    # when present) — the same fetch that's already identifier-verified
+    # for artifact extraction, never a second, unverified caller URL.
     # ------------------------------------------------------------------
 
     @gl.public.write
-    def file_check(self, paper_doi: str, paper_text_url: str, claimed_finding_text: str) -> str:
+    def file_check(self, paper_doi: str, claimed_finding_text: str) -> str:
         clean_doi = _sanitize_doi(paper_doi, 128)
-        clean_text_url = _sanitize(paper_text_url, _MAX_TEXT_LEN)
         clean_finding = _sanitize(claimed_finding_text, _MAX_TEXT_LEN)
 
         assert len(clean_doi) > 0, "paper_doi must be a valid DOI"
-        assert len(clean_text_url) > 0, "paper_text_url cannot be empty"
         assert len(clean_finding) > 0, "claimed_finding_text cannot be empty"
 
         cid = self.next_id
@@ -445,7 +551,6 @@ class ReplicationBind(gl.Contract):
             check_id=cid,
             submitter=gl.message.sender_address,
             paper_doi=clean_doi,
-            paper_text_url=clean_text_url,
             claimed_finding_text=clean_finding,
             status="filed",
             verdict="",
@@ -479,13 +584,39 @@ class ReplicationBind(gl.Contract):
 
         # Bug 6 fix: nested functions, zero self reference anywhere.
         def leader_fn():
-            paper_text = _fetch_text(c_mem.paper_text_url)
-
+            # Single Crossref fetch serves BOTH the paper-text source and
+            # the artifact extraction — this is the fix for "bind the
+            # paper text to the DOI through an independently derived or
+            # verified source." There is no second, caller-supplied text
+            # URL anymore; the paper's own abstract (when Crossref
+            # provides one) is the text source, gated by the exact same
+            # identifier-verification check as the artifact list.
             crossref_ok, crossref_payload = _fetch_json(_crossref_works_url(c_mem.paper_doi))
-            if crossref_ok:
-                declared_artifacts = _extract_declared_artifacts_from_crossref(crossref_payload)
-            else:
+
+            if not crossref_ok:
+                # Fix #1: a fetch failure is NOT the same fact as "the
+                # record was confirmed and declares nothing." Signal this
+                # distinctly so the LLM is instructed toward unverifiable,
+                # never artifact_undeclared, for this case.
+                extraction_ok = False
                 declared_artifacts = []
+                paper_text = f"[Crossref fetch failed: {crossref_payload}]"
+            else:
+                extraction_ok, declared_artifacts = _extract_declared_artifacts_from_crossref(
+                    crossref_payload, c_mem.paper_doi
+                )
+                if not extraction_ok:
+                    # Fetch succeeded but the payload's self-reported DOI
+                    # did not match what we asked for (see
+                    # _has_reportedly_matching_doi) — same "cannot trust
+                    # this record" signal as a fetch failure, structurally
+                    # distinct from a confirmed-empty declared list.
+                    paper_text = "[Crossref record fetched but did not confirm the requested DOI]"
+                else:
+                    message = crossref_payload.get("message", {}) if isinstance(crossref_payload, dict) else {}
+                    abstract = message.get("abstract", "") if isinstance(message, dict) else ""
+                    paper_text = abstract if isinstance(abstract, str) and abstract.strip() else "[no abstract in Crossref record]"
+
             artifacts_text = json.dumps(declared_artifacts)
 
             prompt = "\n".join([
@@ -494,15 +625,27 @@ class ReplicationBind(gl.Contract):
                 "CLAIMED FINDING (the specific claim the submitter is asking about):",
                 _wrap_untrusted("FINDING", _sanitize(c_mem.claimed_finding_text, _MAX_TEXT_LEN)),
                 "",
-                "PAPER TEXT (fetched fresh by the contract):",
+                "PAPER TEXT — this paper's own abstract, as declared in ITS OWN "
+                "Crossref record for the submitted DOI (fetched and identifier-"
+                "verified fresh by the contract; if Crossref could not be fetched "
+                "or did not confirm this DOI, that failure is stated here directly "
+                "and you must return 'unverifiable', never guess at the paper's "
+                "content):",
                 _wrap_untrusted("PAPER_TEXT", _sanitize(paper_text, _MAX_FETCH_LEN)),
                 "",
                 "DECLARED ARTIFACT LINKS — extracted by the contract directly from "
-                "this paper's own Crossref record, as a JSON array (each item has a "
-                "'url' and a 'label' describing where the contract found it). If "
-                "this array is empty, the paper's own bibliographic record declares "
-                "NO artifact at all — you must not treat prose in the paper text "
-                "above as a substitute for an entry in this list:",
+                "this SAME identifier-verified Crossref record, restricted to "
+                "relation types that specifically denote a reproducibility "
+                "artifact (never every relation type Crossref happens to list), "
+                "as a JSON array (each item has a 'url' and a 'label' describing "
+                "where the contract found it). This array is only meaningful if "
+                "the paper text above was NOT reported as a fetch/verification "
+                "failure — if it WAS a failure, treat the whole record as "
+                "unverifiable regardless of what this array shows. If the record "
+                "was successfully fetched and verified but this array is empty, "
+                "the paper's own record declares NO artifact at all — you must "
+                "not treat prose in the paper text above as a substitute for an "
+                "entry in this list:",
                 _wrap_untrusted("DECLARED_ARTIFACTS", _sanitize(artifacts_text, _MAX_FETCH_LEN)),
                 "",
                 'Respond ONLY with JSON using exactly these keys: '
@@ -516,13 +659,15 @@ class ReplicationBind(gl.Contract):
             ])
             result = gl.nondet.exec_prompt(prompt, response_format="json")
             parsed = _parse_leader_json(result)
-            # Attach the deterministically-derived count alongside the
-            # parsed LLM output — this is NOT part of what the model
-            # returns, it's appended here so validator_fn can compare it
-            # too (see below), keeping the "declared artifact count" a
-            # value both leader and validator independently re-fetch and
-            # agree on, not a number only the leader ever computed.
+            # Attach deterministically-derived facts alongside the parsed
+            # LLM output — these are NOT part of what the model returns,
+            # they're appended here so validator_fn can independently
+            # compare them too, keeping every fact the verdict depends on
+            # a value both leader and validator separately re-fetch and
+            # agree on, never a number only the leader ever computed.
+            parsed["_crossref_extraction_ok"] = extraction_ok
             parsed["_declared_artifact_count"] = len(declared_artifacts)
+            parsed["_declared_artifact_urls"] = tuple(a["url"] for a in declared_artifacts)
             return parsed
 
         def validator_fn(leaders_res) -> bool:
@@ -553,25 +698,40 @@ class ReplicationBind(gl.Contract):
             reasoning = leader_data.get("reasoning_summary", "")
             if not isinstance(reasoning, str) or len(reasoning.strip()) < _MIN_REASONING_LEN:
                 return False
-            # The declared-artifact count is a field the verdict directly
-            # depends on (an "artifact_undeclared" verdict is only
-            # meaningful if both sides independently confirmed the list
-            # was really empty) — per this project's confirmed rule that
-            # every field a verdict depends on must be independently
-            # re-derived and compared, never excluded because it's "just
-            # a count." Both leader and validator fetched Crossref
-            # separately inside their own leader_fn() call; requiring
-            # this to match confirms they saw the same declared state,
-            # not just that they both happened to pick the same verdict
+            # Every fact the verdict depends on is independently re-
+            # derived and compared here, per this project's confirmed
+            # rule that no such field is excluded because it's "just a
+            # count" or "just a flag." Both leader and validator fetched
+            # Crossref separately inside their own leader_fn() call;
+            # requiring all three to match confirms they saw the same
+            # confirmed state, not just that they picked the same verdict
             # word for potentially different reasons.
+            if leader_data.get("_crossref_extraction_ok") != my_data.get("_crossref_extraction_ok"):
+                return False
             if leader_data.get("_declared_artifact_count") != my_data.get("_declared_artifact_count"):
                 return False
-            # matched_artifact_url is only load-bearing when the verdict
-            # claims a specific artifact backs the finding.
+            if leader_data.get("_declared_artifact_urls") != my_data.get("_declared_artifact_urls"):
+                return False
+            # A record that failed the identifier-verification/fetch gate
+            # can never legitimately support anything but 'unverifiable'
+            # — this is a deterministic assertion, not trust that the LLM
+            # happened to pick the right verdict on its own.
+            if not leader_data.get("_crossref_extraction_ok") and leader_data.get("verdict") != "unverifiable":
+                return False
             leader_url = leader_data.get("matched_artifact_url", "")
             my_url = my_data.get("matched_artifact_url", "")
             if leader_data.get("verdict") == "artifact_backed":
                 if not leader_url or leader_url != my_url:
+                    return False
+                # Fix #4, made explicit and code-enforced rather than
+                # implied by URL agreement: artifact_backed additionally
+                # REQUIRES a nonzero declared-artifact count AND that the
+                # matched URL is actually a member of the deterministically
+                # extracted list — never trusted purely because the LLM
+                # said so and both sides happened to agree on a string.
+                if int(leader_data.get("_declared_artifact_count", 0)) <= 0:
+                    return False
+                if leader_url not in leader_data.get("_declared_artifact_urls", ()):
                     return False
             return True
 
@@ -606,7 +766,6 @@ class ReplicationBind(gl.Contract):
             "check_id": int(c.check_id),
             "submitter": str(c.submitter),
             "paper_doi": c.paper_doi,
-            "paper_text_url": c.paper_text_url,
             "claimed_finding_text": c.claimed_finding_text,
             "status": c.status,
             "verdict": c.verdict,
