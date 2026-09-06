@@ -53,28 +53,58 @@ is checked directly, byte-for-byte, against the page that was actually
 fetched in that exact call. There is no intermediate record whose
 identity could be wrong.
 
-VERDICT SHAPE — three-way, every value traced to an exact leader_fn
-branch before submission, per rule 11 below:
-    "anchor_present"    -> reachable page fetched AND anchor substring
-                            found verbatim in the normalized page text.
-                            Produced by the branch where fetch succeeds
+VERDICT SHAPE — four-way, every value traced to an exact leader_fn
+branch before submission, per rule 11 below. Expanded from three to four
+values (Sep 2026 revision) specifically to fix a confirmed correctness
+defect: see CORRECTNESS FIX note below before assuming three is enough.
+    "anchor_present"     -> reachable page fetched, fetched text is within
+                            the searchable size bound, AND anchor
+                            substring found verbatim in the complete
+                            normalized page text. Produced by the branch
+                            where fetch succeeds, size is within bound,
                             and the containment check returns True.
-    "anchor_missing"    -> reachable page fetched AND anchor substring
-                            NOT found verbatim in the normalized page
-                            text. Produced by the branch where fetch
-                            succeeds and the containment check returns
-                            False.
+    "anchor_missing"     -> reachable page fetched, fetched text is within
+                            the searchable size bound, AND anchor
+                            substring NOT found verbatim in the complete
+                            normalized page text. Produced by the branch
+                            where fetch succeeds, size is within bound,
+                            and the containment check returns False.
     "source_unavailable" -> the fetch itself failed or returned no
                             readable text. Produced by the branch where
                             _fetch_text returns one of its confirmed
-                            marker strings. No other branch can produce
-                            this value, and no other value can be
-                            produced by this branch, so no case exists
-                            where leader_fn structurally cannot reach a
-                            legal verdict value or could legally reach
-                            one it isn't in a position to justify. This
-                            mapping is exhaustive and 1:1 against
-                            _VALID_VERDICTS below.
+                            marker strings.
+    "source_too_large"   -> the fetch succeeded and returned readable
+                            text, but the decoded page exceeds
+                            _MAX_SEARCHABLE_CHARS before any truncation is
+                            applied. Produced by the branch that checks
+                            raw decoded length against the bound BEFORE
+                            calling _check_anchor at all — this branch is
+                            reached instead of running a truncated,
+                            unreliable search, never in addition to one.
+No other branch can produce any of these four values, and no other value
+can be produced by any of these four branches, so the mapping is
+exhaustive and 1:1 against _VALID_VERDICTS below.
+
+CORRECTNESS FIX (Sep 2026 revision — steward-requested, "More Information
+Needed" response) — read before touching _check_anchor or _MAX_PAGE_CHARS
+again: the original three-way version searched for the anchor inside
+`_sanitize(fetched_text, _MAX_PAGE_CHARS)`, which silently truncated the
+decoded page to its first 20,000 characters BEFORE the containment check
+ran. An anchor that was genuinely still present later in the document was
+therefore reported anchor_missing — a false negative in the exact
+guarantee this contract exists to make, not a cosmetic issue. The fix:
+_check_anchor now runs against the COMPLETE decoded page text with no
+truncation, and truncation is applied ONLY to the copy of the text that
+may be shown to the LLM for diff_context purposes (a non-authoritative
+annotation, per the DELIBERATE GAPS section below) — never to the copy
+the deterministic verdict is derived from. Separately, if the complete
+decoded page exceeds _MAX_SEARCHABLE_CHARS, the contract now refuses to
+guess: it reports the distinct source_too_large verdict rather than
+running a partial search and reporting anchor_missing on a page it never
+fully examined. This means anchor_missing is now a strictly stronger
+claim than before: it is only ever produced when the ENTIRE fetched
+document was searched and the anchor was genuinely absent from all of
+it, never when the document was too large to fully check.
 
 DELIBERATE GAPS, STATED EXPLICITLY
 ------------------------------------
@@ -96,7 +126,21 @@ DELIBERATE GAPS, STATED EXPLICITLY
   human-readable color, not evidence the verdict depends on. Documented
   here explicitly per rule 9's "every field the verdict depends on" —
   this field is deliberately excluded because the verdict does not
-  depend on it at all, not because it was overlooked.
+  depend on it at all, not because it was overlooked. diff_context is
+  now built from a SEPARATELY-truncated copy of the page text (see
+  _build_diff_context_prompt), never from the same untruncated text the
+  verdict search runs against — the two truncation policies are
+  intentionally decoupled after the Sep 2026 fix, since the LLM
+  annotation was always allowed to be a bounded, best-effort excerpt
+  while the deterministic verdict now must not be.
+- source_too_large is a genuine, intentional refusal-to-guess outcome,
+  not a placeholder for "not implemented yet": a full future version
+  could raise _MAX_SEARCHABLE_CHARS or add chunked searching, but doing
+  so is out of scope for this track's single-technique focus per
+  section 10.1's scope discipline — the correctness guarantee this
+  contract makes (anchor_missing means the WHOLE document was checked)
+  must hold at whatever size bound is chosen, and expanding the bound
+  later is a capacity change, not a correctness change.
 """
 
 from genlayer import *
@@ -115,13 +159,40 @@ _MIN_ANCHOR_LEN = 8  # a trivially short anchor (e.g. "the") would match
                        # integrity check; require a meaningfully specific
                        # substring.
 _MAX_LABEL_LEN = 200
-_MAX_PAGE_CHARS = 20000
+
+# _MAX_SEARCHABLE_CHARS bounds how large a fetched document this contract
+# will commit to searching COMPLETELY. This is a hard ceiling on the raw
+# decoded page length, checked BEFORE any truncation and BEFORE the
+# containment search runs — never a truncation length applied to the
+# text the search itself uses. If the decoded page exceeds this, the
+# contract reports source_too_large rather than searching a partial
+# document and risking a false anchor_missing. Kept well above typical
+# article/policy-page sizes while still bounded, since nondet prompt
+# payloads (see _MAX_PAGE_CHARS_FOR_LLM below) already cap what can
+# reasonably be sent to exec_prompt regardless of this bound.
+_MAX_SEARCHABLE_CHARS = 200000
+
+# _MAX_PAGE_CHARS_FOR_LLM bounds ONLY the copy of the page text that may
+# be shown to the LLM when building a non-authoritative diff_context
+# annotation (see _build_diff_context_prompt). This is intentionally a
+# SEPARATE constant from _MAX_SEARCHABLE_CHARS and is never used by
+# _check_anchor — the deterministic verdict search always runs against
+# the complete decoded page (up to _MAX_SEARCHABLE_CHARS), while the LLM
+# annotation is allowed to see only a bounded excerpt, since it is
+# explicitly non-authoritative and excluded from consensus agreement.
+_MAX_PAGE_CHARS_FOR_LLM = 12000
+
 _MAX_DIFF_CONTEXT_LEN = 400
 
 _STATUS_WATCHING = "watching"
 _STATUS_CHECKED = "checked"
 
-_VALID_VERDICTS = ("anchor_present", "anchor_missing", "source_unavailable")
+_VALID_VERDICTS = (
+    "anchor_present",
+    "anchor_missing",
+    "source_unavailable",
+    "source_too_large",
+)
 
 # Bug 1's confirmed marker-string family — any fetch failure produces one
 # of these exact prefixes, checked via startswith below, never re-derived
@@ -144,7 +215,16 @@ _CHARTER = (
 )
 
 
-def _sanitize(text, max_len=_MAX_PAGE_CHARS) -> str:
+def _sanitize(text, max_len=None) -> str:
+    """
+    max_len=None means NO truncation is applied — only character
+    stripping/replacement. This default changed in the Sep 2026
+    correctness fix specifically so that a call site which forgets to
+    pass max_len fails safe (no truncation) rather than silently
+    reintroducing a length cap. Every call site that DOES want a length
+    cap (the LLM-annotation prompt builder, storage-field writes) passes
+    max_len explicitly.
+    """
     if text is None:
         return ""
     if not isinstance(text, str):
@@ -153,7 +233,7 @@ def _sanitize(text, max_len=_MAX_PAGE_CHARS) -> str:
     cleaned = cleaned.replace("```", "'''").replace("---", "- - -")
     cleaned = cleaned.replace("<|", "[ ").replace("|>", " ]")
     cleaned = cleaned.replace("[SYSTEM]", "[ SYSTEM ]").replace("[INST]", "[ INST ]")
-    if len(cleaned) > max_len:
+    if max_len is not None and len(cleaned) > max_len:
         cleaned = cleaned[:max_len]
     return cleaned.strip()
 
@@ -217,27 +297,61 @@ def _is_fetch_failure(fetched_text) -> bool:
     return isinstance(fetched_text, str) and fetched_text.startswith(_FETCH_FAILURE_PREFIX)
 
 
+def _exceeds_searchable_bound(fetched_text) -> bool:
+    """
+    Checked BEFORE _check_anchor is ever called, against the raw decoded
+    fetch result — never against a sanitized/truncated copy, since the
+    whole point is deciding whether a complete, untruncated search is
+    even possible. A page that fails this check must route to
+    source_too_large, never to _check_anchor.
+    """
+    if not isinstance(fetched_text, str):
+        return True
+    return len(fetched_text) > _MAX_SEARCHABLE_CHARS
+
+
 def _check_anchor(fetched_text, anchor) -> bool:
     """
     THE deterministic core of this contract. No LLM involvement. Both
     leader and every validator call this exact function against their own
     independently-fetched page content — the verdict is whichever boolean
     this pure function returns, not an LLM's opinion about it.
+
+    CORRECTNESS FIX (Sep 2026): this now searches the COMPLETE fetched
+    text with no length truncation whatsoever — only whitespace-run
+    normalization is applied (via _normalize_page_text), never a
+    max_len cutoff. Truncating the searched text before this check was
+    a confirmed false-negative bug (see module docstring's CORRECTNESS
+    FIX note): an anchor genuinely present beyond the old 20,000-char
+    cutoff was silently reported as missing. Callers MUST call
+    _exceeds_searchable_bound() first and route to source_too_large
+    instead of calling this function at all when it returns True — this
+    function itself intentionally performs no size gating, so that its
+    only job is the correctness-critical containment check itself.
+    _sanitize is still applied (control-character/injection-marker
+    stripping), but WITHOUT a max_len argument, so no truncation occurs.
     """
-    normalized_page = _normalize_page_text(_sanitize(fetched_text, _MAX_PAGE_CHARS))
+    normalized_page = _normalize_page_text(_sanitize(fetched_text))
     normalized_anchor = _normalize_page_text(anchor)
     return normalized_anchor in normalized_page
 
 
 def _build_diff_context_prompt(fetched_text, anchor) -> str:
+    # Deliberately uses _MAX_PAGE_CHARS_FOR_LLM here, NOT
+    # _MAX_SEARCHABLE_CHARS — this truncation only bounds what the LLM
+    # sees for a non-authoritative annotation and never affects the
+    # verdict, which was already fully determined by _check_anchor
+    # against the complete document before this function is ever called.
     parts = [
         _CHARTER,
         "",
         "EXPECTED ANCHOR (verbatim, no longer found):",
         _wrap_untrusted("ANCHOR", _sanitize(anchor, _MAX_ANCHOR_LEN)),
         "",
-        "CURRENT PAGE TEXT:",
-        _wrap_untrusted("PAGE", _sanitize(fetched_text, _MAX_PAGE_CHARS)),
+        "CURRENT PAGE TEXT (may be truncated for annotation purposes only "
+        "— the absence verdict was already determined against the "
+        "complete document):",
+        _wrap_untrusted("PAGE", _sanitize(fetched_text, _MAX_PAGE_CHARS_FOR_LLM)),
         "",
         'Respond ONLY with JSON using exactly this key: '
         '{"diff_context": "<short verbatim excerpt from PAGE, or empty string>"}',
@@ -357,6 +471,15 @@ class ProvenanceWatch(gl.Contract):
                     "diff_context": "",
                 }
 
+            # Size gate BEFORE any containment search, per the Sep 2026
+            # correctness fix — never search a partial document and
+            # never let _check_anchor perform its own truncation.
+            if _exceeds_searchable_bound(fetched):
+                return {
+                    "verdict": "source_too_large",
+                    "diff_context": "",
+                }
+
             anchor_found = _check_anchor(fetched, w_mem.anchor_text)
 
             if anchor_found:
@@ -366,7 +489,10 @@ class ProvenanceWatch(gl.Contract):
                 }
 
             # anchor_missing: the only branch that calls the LLM at all,
-            # and only for a non-authoritative annotation.
+            # and only for a non-authoritative annotation. Reached only
+            # after a COMPLETE search of the untruncated document found
+            # no match — never reached for a document that was too large
+            # to search completely (that routes to source_too_large above).
             try:
                 prompt = _build_diff_context_prompt(fetched, w_mem.anchor_text)
                 llm_result = gl.nondet.exec_prompt(prompt, response_format="json")
@@ -412,10 +538,27 @@ class ProvenanceWatch(gl.Contract):
                 # fully re-derived, not taken on the leader's word.
                 return True
 
-            # Both sides successfully fetched. The verdict is a pure,
-            # deterministic function of the anchor and the (independently
-            # fetched) page text — re-run it directly, never re-grade an
-            # LLM opinion, since there isn't one for this part.
+            # Size-gate outcome is likewise independently re-derived —
+            # never inferred from the leader's claimed verdict. A leader
+            # that claims anchor_present/anchor_missing on a document
+            # that a validator's own fetch shows exceeds the searchable
+            # bound must be rejected, since that claim could only have
+            # come from an incomplete (truncated) search.
+            my_too_large = _exceeds_searchable_bound(my_fetched)
+            leader_too_large = (leader_verdict == "source_too_large")
+            if my_too_large != leader_too_large:
+                return False
+
+            if my_too_large:
+                # Both sides agree the document exceeds the searchable
+                # bound — the only legal path to source_too_large.
+                return True
+
+            # Both sides successfully fetched a searchable-size document.
+            # The verdict is a pure, deterministic function of the anchor
+            # and the (independently fetched) COMPLETE page text — re-run
+            # it directly, never re-grade an LLM opinion, since there
+            # isn't one for this part.
             my_anchor_found = _check_anchor(my_fetched, w_mem.anchor_text)
             my_verdict = "anchor_present" if my_anchor_found else "anchor_missing"
 
