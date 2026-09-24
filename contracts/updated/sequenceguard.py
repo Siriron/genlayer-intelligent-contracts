@@ -104,11 +104,22 @@ RULE_ORDER_VIOLATED = 2
 RULE_PRECONDITION_UNMET = 3
 RULE_AMBIGUOUS = 4
 
+# NOTE: there is no VERIFICATION_OVERTURNED value. An earlier draft used
+# it as a distinct terminal status for a challenge that changed the
+# outcome, but that made verification.status an opaque bucket no
+# consumer (log_passes(), a downstream integrator reading status
+# directly) could act on — a challenge that overturned a non-passing
+# result TO passing would leave status stuck at OVERTURNED instead of
+# PASSED, so log_passes() could never return True for it. Removed
+# entirely: challenge_verification() now persists the RESOLVED status
+# (PASSED/FAILED/AMBIGUOUS) directly, and "was this overturned" is
+# still fully recoverable via challenge_used + the emitted
+# VerificationChallenged event's own overturned field, never via a
+# fourth status value.
 VERIFICATION_PENDING = 0
 VERIFICATION_PASSED = 1
 VERIFICATION_FAILED = 2
 VERIFICATION_AMBIGUOUS = 3
-VERIFICATION_OVERTURNED = 4
 
 MAX_SPEC_NAME_LEN = 96
 MAX_STEP_NAME_LEN = 64
@@ -128,7 +139,6 @@ _RULE_STATUS_NAMES = {
 _VERIFICATION_STATUS_NAMES = {
     VERIFICATION_PENDING: "PENDING", VERIFICATION_PASSED: "PASSED",
     VERIFICATION_FAILED: "FAILED", VERIFICATION_AMBIGUOUS: "AMBIGUOUS",
-    VERIFICATION_OVERTURNED: "OVERTURNED",
 }
 
 
@@ -819,7 +829,20 @@ class SequenceGuard(gl.Contract):
 
         verification.challenge_used = True
         overturned = int(new_status) != int(verification.status)
-        verification.status = u8(VERIFICATION_OVERTURNED if overturned else int(verification.status))
+        # Persist the RESOLVED status (PASSED/FAILED/AMBIGUOUS) directly,
+        # never an opaque OVERTURNED bucket — this is the steward-flagged
+        # fix. get_verification() and log_passes() both read
+        # verification.status as the single source of truth for "is this
+        # log currently passing," so a challenge that changes a
+        # non-passing original result to PASSED must leave status set to
+        # VERIFICATION_PASSED itself, not to a third value neither
+        # consumer can match against. Whether a challenge changed the
+        # outcome is still fully recoverable — `overturned` here and the
+        # emitted VerificationChallenged event both carry it, and
+        # get_verification() separately reports challenge_used plus the
+        # original pre-challenge results — so no information is lost by
+        # removing the separate OVERTURNED status value.
+        verification.status = u8(int(new_status))
         verification.checked_at = current_datetime()
         # Append the challenge round's own independent findings to the
         # dedicated challenge_results field (never touching the original
@@ -837,7 +860,7 @@ class SequenceGuard(gl.Contract):
                 )
             )
 
-        VerificationChallenged(log_id, u8(verification.status), overturned=overturned, resolved_status=int(new_status)).emit()
+        VerificationChallenged(log_id, u8(verification.status), overturned=overturned).emit()
         return log_id
 
     # ------------------------------------------------------------------
@@ -955,5 +978,4 @@ class SequenceGuard(gl.Contract):
             "RULE_AMBIGUOUS": RULE_AMBIGUOUS,
             "VERIFICATION_PENDING": VERIFICATION_PENDING, "VERIFICATION_PASSED": VERIFICATION_PASSED,
             "VERIFICATION_FAILED": VERIFICATION_FAILED, "VERIFICATION_AMBIGUOUS": VERIFICATION_AMBIGUOUS,
-            "VERIFICATION_OVERTURNED": VERIFICATION_OVERTURNED,
         }

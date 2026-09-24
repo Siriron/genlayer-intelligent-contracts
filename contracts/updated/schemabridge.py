@@ -474,6 +474,20 @@ def _convert_factor(source_unit: str, target_unit: str) -> typing.Optional[tuple
 # ---------------------------------------------------------------------------
 
 def _deterministic_pair_relation(source: dict, target: dict) -> typing.Optional[int]:
+    """Returns a fully-resolved relation only when unit/type compatibility
+    is SUFFICIENT on its own to prove the pair describes the same
+    real-world quantity — never on unit/type compatibility alone. A
+    shared unit or unit family is necessary but not sufficient: two
+    unrelated fields (e.g. max_speed vs wind_speed, both
+    meters_per_second) are unit-compatible without being the same
+    concept, so unit/family/type agreement can only shortcut the model
+    call when the field NAMES also agree exactly (the one case where
+    identity is otherwise established) or when there is no unit at all
+    to anchor on and the names are identical. Every other compatible-
+    but-not-identically-named pair must still go to the model for a
+    real same-concept judgment — this closes the gap the steward
+    flagged (EQUIVALENT asserted from unit-compatibility alone, without
+    checking the fields describe the same concept)."""
     if int(source["ltype"]) != int(target["ltype"]):
         # A small number of allowed safe widenings (never narrowing):
         # integer source can populate a decimal target losslessly.
@@ -481,19 +495,39 @@ def _deterministic_pair_relation(source: dict, target: dict) -> typing.Optional[
             return RELATION_TYPE_CONFLICT
     source_unit = str(source["unit"])
     target_unit = str(target["unit"])
+    same_name = source["name"] == target["name"]
     if source_unit == "" and target_unit == "":
-        if source["name"] == target["name"]:
+        if same_name:
             return RELATION_EQUIVALENT
         return None  # genuinely needs semantic judgment (no units to anchor on)
     if source_unit != "" and target_unit != "":
         if _convert_factor(source_unit, target_unit) is not None:
-            return RELATION_EQUIVALENT
+            # A known numeric conversion between these exact units is
+            # still only evidence of unit compatibility, not of shared
+            # concept — require identical field names too before
+            # asserting EQUIVALENT with zero model call. A same-unit,
+            # different-name pair (e.g. max_speed vs wind_speed) falls
+            # through to the model instead of being auto-matched.
+            if same_name:
+                return RELATION_EQUIVALENT
+            return None
         source_family = unit_family(source_unit)
         target_family = unit_family(target_unit)
         if source_family != "" and source_family == target_family:
-            return RELATION_SAME_FAMILY_UNKNOWN_RATE
+            # Same family alone (e.g. both "speed") never implies same
+            # concept even at the weaker SAME_FAMILY_UNKNOWN_RATE level
+            # without at least matching names — otherwise any two
+            # same-family, differently-named fields would be marked
+            # related with zero semantic check. Fall through to the
+            # model for a real judgment unless the names already agree.
+            if same_name:
+                return RELATION_SAME_FAMILY_UNKNOWN_RATE
+            return None
         if source_family != "" and target_family != "" and source_family != target_family:
-            return RELATION_UNRELATED
+            return RELATION_UNRELATED  # different physical quantities — safe to
+                                         # resolve deterministically regardless of
+                                         # name, since no name similarity can make
+                                         # two different physical quantities equal
     return None  # ambiguous unit presence/absence, or unrecognized units — ask the model
 
 
@@ -563,34 +597,31 @@ def _classify_pair_once(source: dict, target: dict) -> int:
     return _parse_unit_relation(raw)
 
 
-def _best_target_for_source(source: dict, target_fields: list[dict]) -> dict:
-    """Deterministically classify a source field against every target
-    field, then apply fixed precedence to pick the single best mapping:
-    EQUIVALENT beats SAME_FAMILY_UNKNOWN_RATE beats everything else. Ties
-    within the same relation are resolved by lowest target index — fully
-    deterministic given a fixed classification vector, so the leader
-    cannot pick a different "best" match than the validator would from
-    the identical set of per-pair relations."""
-    precedence = {
-        RELATION_EQUIVALENT: 0,
-        RELATION_SAME_FAMILY_UNKNOWN_RATE: 1,
-        RELATION_AMBIGUOUS: 2,
-        RELATION_TYPE_CONFLICT: 3,
-        RELATION_UNRELATED: 4,
-    }
-    best = None
-    best_relation = None
-    best_rank = 99
-    for target in target_fields:
+_RELATION_PRECEDENCE = {
+    RELATION_EQUIVALENT: 0,
+    RELATION_SAME_FAMILY_UNKNOWN_RATE: 1,
+    RELATION_AMBIGUOUS: 2,
+    RELATION_TYPE_CONFLICT: 3,
+    RELATION_UNRELATED: 4,
+}
+
+
+def _classify_source_against_all_targets(source: dict, target_fields: list[dict]) -> list[dict]:
+    """Classify one source field against every target field and return
+    every non-degenerate (relation, target_index, rank) candidate,
+    sorted best-first. Does NOT pick a winner — picking happens only
+    after every source's full candidate list exists, so target
+    assignment can be made one-to-one globally rather than each source
+    independently grabbing whichever target it individually prefers."""
+    candidates = []
+    for index, target in enumerate(target_fields):
         relation = _classify_pair_once(source, target)
-        rank = precedence.get(relation, 99)
-        if rank < best_rank:
-            best = target
-            best_relation = relation
-            best_rank = rank
-    if best is None or best_relation in (RELATION_UNRELATED, RELATION_TYPE_CONFLICT, None):
-        return {"target_field": "", "relation": RELATION_UNRELATED if best_relation is None else best_relation}
-    return {"target_field": str(best["name"]), "relation": int(best_relation)}
+        rank = _RELATION_PRECEDENCE.get(relation, 99)
+        if relation in (RELATION_UNRELATED, RELATION_TYPE_CONFLICT):
+            continue  # never a candidate assignment regardless of tie-breaking
+        candidates.append({"target_index": index, "relation": relation, "rank": rank})
+    candidates.sort(key=lambda c: (c["rank"], c["target_index"]))
+    return candidates
 
 
 def reconcile_once(source_fields: list[dict], target_fields: list[dict]) -> dict:
@@ -598,14 +629,43 @@ def reconcile_once(source_fields: list[dict], target_fields: list[dict]) -> dict
     call inside run_nondet_unsafe wraps a call to this function, which
     itself internally makes zero-or-more gl.nondet.exec_prompt() calls,
     one per candidate pair that the deterministic gate could not resolve.
-    Returns a fully canonical, JSON-serializable dict."""
+    Returns a fully canonical, JSON-serializable dict.
+
+    One-to-one target assignment (fixes the steward-flagged gap): every
+    target field can be claimed by at most one source field. Assignment
+    is resolved deterministically and identically for leader and every
+    validator, since it depends only on the fixed classification vector
+    (never on iteration order or a race): process sources in a fixed,
+    stable order (by ascending source index, i.e. list order — the
+    source list itself is already a fixed, ordered input to this
+    function), and for each source take its best-ranked, not-yet-taken
+    target. This can leave a later source's nominally-best target
+    already claimed by an earlier source's equally- or better-ranked
+    candidate; the later source then falls through to its next-best
+    unclaimed candidate, or to no mapping (relation UNRELATED, empty
+    target_field) if none remain. This never assigns two different
+    source fields to the same target_field in one reconciliation."""
+    claimed_target_indices = set()
     rows = []
     for source in source_fields:
-        outcome = _best_target_for_source(source, target_fields)
+        candidates = _classify_source_against_all_targets(source, target_fields)
+        chosen = None
+        for candidate in candidates:
+            if candidate["target_index"] not in claimed_target_indices:
+                chosen = candidate
+                break
+        if chosen is None:
+            rows.append({
+                "source_field": str(source["name"]),
+                "target_field": "",
+                "relation": RELATION_UNRELATED,
+            })
+            continue
+        claimed_target_indices.add(chosen["target_index"])
         rows.append({
             "source_field": str(source["name"]),
-            "target_field": outcome["target_field"],
-            "relation": int(outcome["relation"]),
+            "target_field": str(target_fields[chosen["target_index"]]["name"]),
+            "relation": int(chosen["relation"]),
         })
     return {"rows": rows}
 
